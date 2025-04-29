@@ -3,8 +3,8 @@ package main
 import (
 	"net/http"
 
-	"github.com/Anish-Chanda/double-layer-dedup/cmd/internal/config"
-	"github.com/Anish-Chanda/double-layer-dedup/cmd/internal/logger"
+	"github.com/Anish-Chanda/double-layer-dedup/internal/config"
+	"github.com/Anish-Chanda/double-layer-dedup/internal/logger"
 	"go.uber.org/zap"
 )
 
