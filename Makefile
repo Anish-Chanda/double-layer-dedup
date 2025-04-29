@@ -18,5 +18,8 @@ run:
 test:
 	go test ./...
 
+test-aws:
+	go run ./cmd/awschecks/
+
 clean:
 	rm -rf bin
