@@ -14,7 +14,11 @@ require (
 	go.uber.org/zap v1.27.0
 )
 
-require github.com/bits-and-blooms/bitset v1.10.0 // indirect
+require (
+	github.com/bits-and-blooms/bitset v1.10.0 // indirect
+	github.com/go-chi/chi/v5 v5.2.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+)
 
 require (
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.6.10 // indirect
