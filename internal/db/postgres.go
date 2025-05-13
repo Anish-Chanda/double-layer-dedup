@@ -16,6 +16,20 @@ type Client struct {
 	db *sqlx.DB
 }
 
+// FileMeta holds the key DSDE metadata for a file.
+type FileMeta struct {
+	FeaHash   []byte `db:"fea_hash"`
+	DekShared []byte `db:"dek_shared"`
+	DekUser   []byte `db:"dek_user"`
+	Pkg2Len   int    `db:"pkg2_len"`
+}
+
+// ChunkInfo holds the s3 key and common‐flag for each stored blob.
+type ChunkInfo struct {
+	S3Key    string `db:"s3_key"`
+	IsCommon bool   `db:"is_common"`
+}
+
 // New connects to Postgres using DSDE_POSTGRES_DSN.
 func New(cfg *config.Config) (*Client, error) {
 	if cfg.PostgresDSN == "" {
@@ -69,14 +83,15 @@ func (c *Client) CreateFile(ownerID, filename string) (string, error) {
 func (c *Client) CreateFileWithMeta(
 	ownerID, filename string,
 	feaHash, dekShared, dekUser []byte,
+	pkg2Len int,
 ) (string, error) {
 	var fileID string
 	err := c.db.Get(&fileID, `
-        INSERT INTO files
-          (owner_id, filename, fea_hash, dek_shared, dek_user)
-        VALUES ($1,$2,$3,$4,$5)
-        RETURNING file_id`,
-		ownerID, filename, feaHash, dekShared, dekUser,
+      INSERT INTO files
+        (owner_id, filename, fea_hash, dek_shared, dek_user, pkg2_len)
+      VALUES ($1,$2,$3,$4,$5,$6)
+      RETURNING file_id`,
+		ownerID, filename, feaHash, dekShared, dekUser, pkg2Len,
 	)
 	return fileID, err
 }
@@ -98,25 +113,10 @@ func (c *Client) GetFileChunkHashes(fileID string) ([]string, error) {
 	return hashes, err
 }
 
-// FileMeta holds the key DSDE metadata for a file.
-type FileMeta struct {
-	FeaHash   []byte `db:"fea_hash"`
-	DekShared []byte `db:"dek_shared"`
-	DekUser   []byte `db:"dek_user"`
-}
-
-// ChunkInfo holds the s3 key and common‐flag for each stored blob.
-type ChunkInfo struct {
-	S3Key    string `db:"s3_key"`
-	IsCommon bool   `db:"is_common"`
-}
-
-// GetFileMeta fetches feaHash, both encrypted DEKs, and the ordered blobs.
 func (c *Client) GetFileMeta(ownerID, fileID string) (FileMeta, []ChunkInfo, error) {
 	var meta FileMeta
-	// 1) load the three bytea columns
 	err := c.db.Get(&meta,
-		`SELECT fea_hash, dek_shared, dek_user
+		`SELECT fea_hash, dek_shared, dek_user, pkg2_len
            FROM files
           WHERE file_id=$1 AND owner_id=$2`,
 		fileID, ownerID,
@@ -124,7 +124,6 @@ func (c *Client) GetFileMeta(ownerID, fileID string) (FileMeta, []ChunkInfo, err
 	if err != nil {
 		return meta, nil, err
 	}
-	// 2) fetch the two chunks (seq=0 is d, seq=1 is sBlob)
 	var infos []ChunkInfo
 	err = c.db.Select(&infos,
 		`SELECT c.s3_key, c.is_common
@@ -134,10 +133,7 @@ func (c *Client) GetFileMeta(ownerID, fileID string) (FileMeta, []ChunkInfo, err
           ORDER BY fc.seq`,
 		fileID,
 	)
-	if err != nil {
-		return meta, nil, err
-	}
-	return meta, infos, nil
+	return meta, infos, err
 }
 
 // Feature holds the shared-DEK record for a given fea_hash.

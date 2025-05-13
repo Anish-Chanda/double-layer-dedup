@@ -1,3 +1,4 @@
+// cmd/server/main.go
 package main
 
 import (
@@ -46,16 +47,16 @@ func loadAWSConfig(region string) (aws.Config, error) {
 }
 
 func main() {
-	// 1) Load environment variables from .env
+	// 1) env
 	_ = godotenv.Load()
 
-	// 2) Load application config
+	// 2) config
 	cfg, err := config.Load()
 	if err != nil {
 		panic(fmt.Errorf("config load: %w", err))
 	}
 
-	// 3) Apply database migrations
+	// 3) migrations
 	m, err := migrate.New(
 		"file://"+os.Getenv("PWD")+"/migrations",
 		cfg.PostgresDSN,
@@ -67,36 +68,37 @@ func main() {
 		panic(fmt.Errorf("migrate up: %w", err))
 	}
 
-	// 4) Initialize logger
+	// 4) logger
 	log := logger.New(cfg.LogLevel)
 	defer log.Sync()
+	// make zap.L() available globally
+	zap.ReplaceGlobals(log)
 
-	// 5) Load AWS configuration (points at LocalStack if AWS_ENDPOINT_URL is set)
+	// 5) AWS config
 	awsCfg, err := loadAWSConfig(cfg.AWSRegion)
 	if err != nil {
-		log.Fatal("AWS config", zap.Error(err))
+		zap.L().Fatal("AWS config", zap.Error(err))
 	}
 
-	// 6) Initialize AWS clients
+	// 6) AWS clients
 	kmsClient := kms.NewFromConfig(awsCfg)
 
-	// 7) Initialize infra clients
+	// 7) infra clients
 	storeClient, err := storage.NewWithClient(cfg.S3Bucket, awsCfg)
 	if err != nil {
-		log.Fatal("S3 init", zap.Error(err))
+		zap.L().Fatal("S3 init", zap.Error(err))
 	}
 	dbClient, err := db.New(cfg)
 	if err != nil {
-		log.Fatal("DB init", zap.Error(err))
+		zap.L().Fatal("DB init", zap.Error(err))
 	}
 
-	// 8) Build DSDE service
+	// 8) DSDE service
 	fg := split.NewFG([]uint64{1, 3, 5}, []uint64{0, 0, 0})
 	svc := dsde.NewService(fg, 3, kmsClient, cfg.KMSKeyID, dbClient, storeClient)
 
-	// 9) Configure HTTP router
+	// 9) HTTP router
 	r := chi.NewRouter()
-
 	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
@@ -141,7 +143,6 @@ func main() {
 		io.Copy(w, rc)
 	})
 
-	// list all stored object keys (common + file blobs)
 	r.Get("/admin/s3-list", func(w http.ResponseWriter, r *http.Request) {
 		keys, err := storeClient.ListKeys(r.Context())
 		if err != nil {
@@ -152,9 +153,9 @@ func main() {
 		json.NewEncoder(w).Encode(keys)
 	})
 
-	// 10) Start HTTP server
-	log.Info("starting server", zap.String("addr", cfg.ServerAddr))
+	// 10) start
+	zap.L().Info("starting server", zap.String("addr", cfg.ServerAddr))
 	if err := http.ListenAndServe(cfg.ServerAddr, r); err != nil {
-		log.Fatal("server failed", zap.Error(err))
+		zap.L().Fatal("server failed", zap.Error(err))
 	}
 }
