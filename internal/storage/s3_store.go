@@ -51,3 +51,18 @@ func (c *Client) GetObject(ctx context.Context, key string) (io.ReadCloser, erro
 	}
 	return out.Body, nil
 }
+
+// ListKeys returns all object keys in the bucket.
+func (c *Client) ListKeys(ctx context.Context) ([]string, error) {
+	out, err := c.api.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: &c.bucket,
+	})
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]string, len(out.Contents))
+	for i, obj := range out.Contents {
+		keys[i] = *obj.Key
+	}
+	return keys, nil
+}

@@ -141,6 +141,17 @@ func main() {
 		io.Copy(w, rc)
 	})
 
+	// list all stored object keys (common + file blobs)
+	r.Get("/admin/s3-list", func(w http.ResponseWriter, r *http.Request) {
+		keys, err := storeClient.ListKeys(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(keys)
+	})
+
 	// 10) Start HTTP server
 	log.Info("starting server", zap.String("addr", cfg.ServerAddr))
 	if err := http.ListenAndServe(cfg.ServerAddr, r); err != nil {

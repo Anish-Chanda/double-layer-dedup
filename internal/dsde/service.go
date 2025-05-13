@@ -225,7 +225,7 @@ func (s *Service) Download(
 		return nil, err
 	}
 	// split combined → pkg2, pkg4
-	pkg4, pkg2 := split.PG(meta.FeaHash, combined, s.pgB)
+	pkg2, pkg4 := split.PG(meta.FeaHash, combined, s.pgB)
 
 	// 6) Reconstruct ciphertext pkg3C by inverse-PG on dData & pkg4
 	lf := len(dData) + len(pkg4)
