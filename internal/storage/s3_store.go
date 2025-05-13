@@ -5,38 +5,32 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/Anish-Chanda/double-layer-dedup/internal/config"
-	awsConfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// ErrInvalidConfig is returned when required config is missing.
-var ErrInvalidConfig = fmt.Errorf("AWSRegion and S3Bucket must be set")
-
-// Client wraps the AWS S3 client and bucket name.
+// Client wraps an S3 API client and a bucket name.
 type Client struct {
 	api    *s3.Client
 	bucket string
 }
 
-// New creates a new S3 client using AWS_REGION and S3_BUCKET from config.
-func New(cfg *config.Config) (*Client, error) {
-	if cfg.AWSRegion == "" || cfg.S3Bucket == "" {
-		return nil, ErrInvalidConfig
+// NewWithClient constructs an S3 client for the given bucket using the provided aws.Config.
+// It enables path-style addressing so LocalStack will accept the requests.
+func NewWithClient(bucket string, awsCfg aws.Config) (*Client, error) {
+	if bucket == "" {
+		return nil, fmt.Errorf("bucket name must be set")
 	}
-	awsCfg, err := awsConfig.LoadDefaultConfig(context.Background(),
-		awsConfig.WithRegion(cfg.AWSRegion),
-	)
-	if err != nil {
-		return nil, err
-	}
+	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.UsePathStyle = true
+	})
 	return &Client{
-		api:    s3.NewFromConfig(awsCfg),
-		bucket: cfg.S3Bucket,
+		api:    client,
+		bucket: bucket,
 	}, nil
 }
 
-// PutObject uploads data from the reader to S3 under the given key.
+// PutObject uploads the data from the reader to S3 under the given key.
 func (c *Client) PutObject(ctx context.Context, key string, body io.Reader) error {
 	_, err := c.api.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: &c.bucket,
@@ -46,7 +40,7 @@ func (c *Client) PutObject(ctx context.Context, key string, body io.Reader) erro
 	return err
 }
 
-// GetObject retrieves the object from S3 and returns its read-closer.
+// GetObject retrieves the object from S3 and returns its ReadCloser.
 func (c *Client) GetObject(ctx context.Context, key string) (io.ReadCloser, error) {
 	out, err := c.api.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &c.bucket,
