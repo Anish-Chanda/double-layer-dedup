@@ -9,7 +9,7 @@ import (
 
 // this is one piece of data with its had and common flag
 type ExtractedChunk struct {
-	Date     []byte
+	Data     []byte
 	Hash     string
 	IsCommon bool
 }
@@ -53,7 +53,7 @@ func (e *Extractor) Extract(r io.Reader) ([]ExtractedChunk, error) {
 		}
 
 		chunks = append(chunks, ExtractedChunk{
-			Date:     data,
+			Data:     data,
 			Hash:     string(sum[:]),
 			IsCommon: isCommon,
 		})
