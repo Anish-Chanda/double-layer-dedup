@@ -1,10 +1,10 @@
 # Makefile
 
 # Binaries
-BINARY_SERVER   := dsde-dedupe
+BINARY_SERVER   := server
 CMD_SERVER_DIR  := cmd/server
 
-BINARY_CLIENT   := dsde-client
+BINARY_CLIENT   := client
 CMD_CLIENT_DIR  := cmd/client
 
 .PHONY: all build server client run run-server run-client test test-aws clean

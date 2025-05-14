@@ -5,14 +5,15 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+// New returns a console-encoded (colored) zap.Logger at the given level.
 func New(level string) *zap.Logger {
-	cfg := zap.NewProductionConfig()
-	cfg.EncoderConfig.TimeKey = "timestamp"
-	cfg.Level = zap.NewAtomicLevelAt(zapcore.InfoLevel)
+	cfg := zap.NewDevelopmentConfig()
+	// allow override from env / config
 	if err := cfg.Level.UnmarshalText([]byte(level)); err != nil {
-		// fallback to info
 		cfg.Level = zap.NewAtomicLevelAt(zapcore.InfoLevel)
 	}
-	log, _ := cfg.Build()
+	// ensure colored levels
+	cfg.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+	log, _ := cfg.Build(zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel))
 	return log
 }

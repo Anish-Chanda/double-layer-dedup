@@ -21,12 +21,13 @@ import (
 
 // Service holds the DSDE logic and dependencies.
 type Service struct {
-	fg        *split.FG
-	pgB       int
-	kmsClient *kms.Client
-	kmsKeyID  string
-	db        *db.Client
-	store     *storage.Client
+	fg           *split.FG
+	pgB          int
+	kmsClient    *kms.Client
+	kmsKeyID     string
+	db           *db.Client
+	store        *storage.Client
+	statsEnabled bool
 }
 
 // NewService constructs it.
@@ -37,14 +38,17 @@ func NewService(
 	kmsKeyID string,
 	dbClient *db.Client,
 	storeClient *storage.Client,
+	statsEnabled bool,
+
 ) *Service {
 	return &Service{
-		fg:        fg,
-		pgB:       pgB,
-		kmsClient: kmsClient,
-		kmsKeyID:  kmsKeyID,
-		db:        dbClient,
-		store:     storeClient,
+		fg:           fg,
+		pgB:          pgB,
+		kmsClient:    kmsClient,
+		kmsKeyID:     kmsKeyID,
+		db:           dbClient,
+		store:        storeClient,
+		statsEnabled: statsEnabled,
 	}
 }
 
@@ -57,182 +61,125 @@ func (s *Service) Upload(
 	log := zap.L().Named("Upload")
 	log.Debug("start", zap.String("owner", ownerID), zap.String("file", filename))
 
-	// 1) read file
+	// 1) Read the entire file
 	data, readErr := io.ReadAll(r)
 	if readErr != nil {
 		log.Error("read file", zap.Error(readErr))
 		err = readErr
 		return
 	}
-	log.Debug("read data", zap.Int("bytes", len(data)))
 
-	// 2) FG
-	var fgErr error
-	feaHash, fgErr = s.fg.Feature(bytes.NewReader(data))
-	if fgErr != nil {
-		log.Error("compute feature", zap.Error(fgErr))
-		err = fgErr
+	// 2) Compute FG
+	feaHash, err = s.fg.Feature(bytes.NewReader(data))
+	if err != nil {
+		log.Error("compute feature", zap.Error(err))
 		return
 	}
-	log.Debug("computed feaHash", zap.String("feaHash", fmt.Sprintf("%x", feaHash)))
 
-	// 3) PG split original → pkg1, pkg2
+	// 3) First PG split → pkg1, pkg2_orig
 	pkg1, pkg2_orig := split.PG(feaHash, data, s.pgB)
 	pkg2Len := len(pkg2_orig)
-	log.Debug("PG split original", zap.Int("len_pkg1", len(pkg1)), zap.Int("len_pkg2_orig", pkg2Len))
 
-	// 4) REUSE or GENERATE shared DEK
-	var retrievedCipher []byte
-	var dbQueryError error
-	retrievedCipher, dbQueryError = s.db.GetFeatureByFeaHash(feaHash)
-
-	if dbQueryError != nil {
-		if errors.Is(dbQueryError, sql.ErrNoRows) {
-			log.Debug("new feature, generating shared DEK", zap.String("feaHash", fmt.Sprintf("%x", feaHash)))
-			out1, genKeyErr := s.kmsClient.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{
-				KeyId:   &s.kmsKeyID,
-				KeySpec: "AES_256",
-			})
-			if genKeyErr != nil {
-				log.Error("GenerateDataKey(shared)", zap.Error(genKeyErr))
-				err = genKeyErr
-				return
-			}
-			dekShared = out1.CiphertextBlob
-			if dekShared == nil || len(dekShared) == 0 {
-				err = errors.New("KMS GenerateDataKey returned empty CiphertextBlob for shared DEK")
-				log.Error("empty sharedCipher after generation", zap.Error(err))
-				return
-			}
-
-			if createFeatureErr := s.db.CreateFeature(feaHash, dekShared); createFeatureErr != nil {
-				log.Error("CreateFeature", zap.Error(createFeatureErr))
-				err = createFeatureErr
-				return
-			}
-			log.Debug("new shared DEK created and stored", zap.String("feaHash", fmt.Sprintf("%x", feaHash)), zap.Int("len_cipher", len(dekShared)))
-		} else {
-			log.Error("GetFeatureByFeaHash", zap.Error(dbQueryError), zap.String("feaHash", fmt.Sprintf("%x", feaHash)))
-			err = dbQueryError
+	// 4) Get-or-create shared DEK
+	var sharedCipher []byte
+	if sharedCipher, err = s.db.GetFeatureByFeaHash(feaHash); errors.Is(err, sql.ErrNoRows) {
+		out, gerr := s.kmsClient.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{
+			KeyId:   &s.kmsKeyID,
+			KeySpec: "AES_256",
+		})
+		if gerr != nil {
+			log.Error("GenerateDataKey(shared)", zap.Error(gerr))
+			err = gerr
 			return
 		}
-	} else {
-		dekShared = retrievedCipher
-		log.Debug("reuse shared DEK", zap.String("feaHash", fmt.Sprintf("%x", feaHash)), zap.Int("len_cipher", len(dekShared)))
-		if dekShared == nil || len(dekShared) == 0 {
-			err = fmt.Errorf("reused shared DEK from DB is empty for feaHash %x", feaHash)
-			log.Error("critical: empty shared DEK from DB on reuse", zap.String("feaHash", fmt.Sprintf("%x", feaHash)), zap.Error(err))
+		sharedCipher = out.CiphertextBlob
+		if err = s.db.CreateFeature(feaHash, sharedCipher); err != nil {
+			log.Error("CreateFeature", zap.Error(err))
 			return
 		}
-	}
-
-	// 5) Decrypt shared DEK to plaintext
-	var resp1 *kms.DecryptOutput
-	var decryptSharedErr error
-	resp1, decryptSharedErr = s.kmsClient.Decrypt(ctx, &kms.DecryptInput{CiphertextBlob: dekShared})
-	if decryptSharedErr != nil {
-		log.Error("Decrypt shared DEK", zap.Error(decryptSharedErr), zap.String("feaHash", fmt.Sprintf("%x", feaHash)))
-		err = decryptSharedErr
+	} else if err != nil {
+		log.Error("GetFeatureByFeaHash", zap.Error(err))
 		return
 	}
-	var enc1 *encryption.Service // CORRECTED TYPE
-	var enc1Err error
-	enc1, enc1Err = encryption.NewWithKey(resp1.Plaintext) // NewWithKey returns *encryption.Service
-	if enc1Err != nil {
-		log.Error("encryption.NewWithKey(shared)", zap.Error(enc1Err))
-		err = enc1Err
+	dekShared = sharedCipher
+
+	// 5) Decrypt shared DEK
+	resp1, derr := s.kmsClient.Decrypt(ctx, &kms.DecryptInput{CiphertextBlob: dekShared})
+	if derr != nil {
+		log.Error("Decrypt shared DEK", zap.Error(derr))
+		err = derr
+		return
+	}
+	enc1, err := encryption.NewWithKey(resp1.Plaintext)
+	if err != nil {
+		log.Error("NewWithKey(shared)", zap.Error(err))
 		return
 	}
 
 	// 6) Encrypt pkg1 → pkg3C
-	var pkg3C []byte
-	var encryptPkg1Err error
-	pkg3C, encryptPkg1Err = enc1.Encrypt(pkg1, true)
-	if encryptPkg1Err != nil {
-		log.Error("Encrypt pkg1", zap.Error(encryptPkg1Err))
-		err = encryptPkg1Err
+	pkg3C, err := enc1.Encrypt(pkg1, true)
+	if err != nil {
+		log.Error("Encrypt pkg1", zap.Error(err))
 		return
 	}
-	log.Debug("encrypted pkg1→pkg3C", zap.Int("len", len(pkg3C)))
 
-	// 7) PG split pkg3C → d, pkg4_from_split
-	d, pkg4_from_split := split.PG(feaHash, pkg3C, s.pgB)
-	log.Debug("PG split pkg3C", zap.Int("len_d", len(d)), zap.Int("len_pkg4_from_split", len(pkg4_from_split)))
+	// 7) Second PG split on pkg3C → d, pkg4
+	d, pkg4 := split.PG(feaHash, pkg3C, s.pgB)
 
 	// 8) Generate user DEK
-	var out2 *kms.GenerateDataKeyOutput
-	var genUserKeyErr error
-	out2, genUserKeyErr = s.kmsClient.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{
+	out2, uerr := s.kmsClient.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{
 		KeyId:   &s.kmsKeyID,
 		KeySpec: "AES_256",
 	})
-	if genUserKeyErr != nil {
-		log.Error("GenerateDataKey user", zap.Error(genUserKeyErr))
-		err = genUserKeyErr
+	if uerr != nil {
+		log.Error("GenerateDataKey(user)", zap.Error(uerr))
+		err = uerr
 		return
 	}
 	dekUser = out2.CiphertextBlob
-	log.Debug("generated user DEK", zap.Int("len_cipher", len(dekUser)))
-	var enc2 *encryption.Service // CORRECTED TYPE
-	var enc2Err error
-	enc2, enc2Err = encryption.NewWithKey(out2.Plaintext) // NewWithKey returns *encryption.Service
-	if enc2Err != nil {
-		log.Error("encryption.NewWithKey(user)", zap.Error(enc2Err))
-		err = enc2Err
+	enc2, err := encryption.NewWithKey(out2.Plaintext)
+	if err != nil {
+		log.Error("NewWithKey(user)", zap.Error(err))
 		return
 	}
 
-	// 9) Encrypt pkg2_orig || pkg4_from_split → sBlob
-	combinedForSBlob := append(pkg2_orig, pkg4_from_split...)
-	var sBlob []byte
-	var encryptCombinedErr error
-	sBlob, encryptCombinedErr = enc2.Encrypt(combinedForSBlob, false)
-	if encryptCombinedErr != nil {
-		log.Error("Encrypt combinedForSBlob", zap.Error(encryptCombinedErr))
-		err = encryptCombinedErr
+	// 9) Encrypt pkg2_orig||pkg4 → sBlob
+	combined := append(pkg2_orig, pkg4...)
+	sBlob, err := enc2.Encrypt(combined, false)
+	if err != nil {
+		log.Error("Encrypt combined", zap.Error(err))
 		return
 	}
-	log.Debug("encrypted combinedForSBlob→sBlob", zap.Int("len", len(sBlob)))
 
-	// 10) Persist file metadata
-	var createFileMetaErr error
-	fileID, createFileMetaErr = s.db.CreateFileWithMeta(ownerID, filename, feaHash, dekShared, dekUser, pkg2Len)
-	if createFileMetaErr != nil {
-		log.Error("CreateFileWithMeta", zap.Error(createFileMetaErr))
-		err = createFileMetaErr
+	// 10) Persist file record (remember pkg2Len)
+	fileID, err = s.db.CreateFileWithMeta(ownerID, filename, feaHash, dekShared, dekUser, pkg2Len)
+	if err != nil {
+		log.Error("CreateFileWithMeta", zap.Error(err))
 		return
 	}
-	log.Info("file record created", zap.String("fileID", fileID), zap.Int("pkg2Len_stored", pkg2Len))
 
 	// 11) Store & dedupe “d”
 	hashD := sha256.Sum256(d)
 	hexD := fmt.Sprintf("%x", hashD[:])
 	keyD := "common/" + hexD
-	var existsChunkErr error
-	var exists bool
-	exists, existsChunkErr = s.db.ExistsChunk(hexD)
-	if existsChunkErr != nil {
-		log.Error("ExistsChunk", zap.Error(existsChunkErr))
-		err = existsChunkErr
+
+	existed, err := s.db.ExistsChunk(hexD)
+	if err != nil {
+		log.Error("ExistsChunk", zap.Error(err))
 		return
 	}
-	log.Debug("chunk exists?", zap.String("chunk_d_hash", hexD), zap.Bool("exists", exists))
-	if !exists {
-		if putCommonErr := s.store.PutObject(ctx, keyD, bytes.NewReader(d)); putCommonErr != nil {
-			log.Error("PutObject common (d)", zap.Error(putCommonErr))
-			err = putCommonErr
+	if !existed {
+		if err = s.store.PutObject(ctx, keyD, bytes.NewReader(d)); err != nil {
+			log.Error("PutObject(common)", zap.Error(err))
 			return
 		}
-		if insertChunkCommonErr := s.db.InsertChunk(hexD, keyD, true); insertChunkCommonErr != nil {
-			log.Error("InsertChunk common (d)", zap.Error(insertChunkCommonErr))
-			err = insertChunkCommonErr
+		if err = s.db.InsertChunk(hexD, keyD, true); err != nil {
+			log.Error("InsertChunk(common)", zap.Error(err))
 			return
 		}
-		log.Debug("common chunk (d) stored", zap.String("chunk_d_hash", hexD))
 	}
-	if addFileChunkCommonErr := s.db.AddFileChunk(fileID, hexD, 0); addFileChunkCommonErr != nil {
-		log.Error("AddFileChunk common (d)", zap.Error(addFileChunkCommonErr))
-		err = addFileChunkCommonErr
+	if err = s.db.AddFileChunk(fileID, hexD, 0); err != nil {
+		log.Error("AddFileChunk(common)", zap.Error(err))
 		return
 	}
 
@@ -240,23 +187,35 @@ func (s *Service) Upload(
 	hashS := sha256.Sum256(sBlob)
 	hexS := fmt.Sprintf("%x", hashS[:])
 	keyS := fmt.Sprintf("files/%s/s-%s", fileID, hexS)
-	if putSBlobErr := s.store.PutObject(ctx, keyS, bytes.NewReader(sBlob)); putSBlobErr != nil {
-		log.Error("PutObject sBlob", zap.Error(putSBlobErr))
-		err = putSBlobErr
+	if err = s.store.PutObject(ctx, keyS, bytes.NewReader(sBlob)); err != nil {
+		log.Error("PutObject(sBlob)", zap.Error(err))
 		return
 	}
-	if insertChunkSBlobErr := s.db.InsertChunk(hexS, keyS, false); insertChunkSBlobErr != nil {
-		log.Error("InsertChunk sBlob", zap.Error(insertChunkSBlobErr))
-		err = insertChunkSBlobErr
+	if err = s.db.InsertChunk(hexS, keyS, false); err != nil {
+		log.Error("InsertChunk(sBlob)", zap.Error(err))
 		return
 	}
-	if addFileChunkSBlobErr := s.db.AddFileChunk(fileID, hexS, 1); addFileChunkSBlobErr != nil {
-		log.Error("AddFileChunk sBlob", zap.Error(addFileChunkSBlobErr))
-		err = addFileChunkSBlobErr
+	if err = s.db.AddFileChunk(fileID, hexS, 1); err != nil {
+		log.Error("AddFileChunk(sBlob)", zap.Error(err))
 		return
 	}
 
 	log.Info("upload complete", zap.String("fileID", fileID))
+
+	// ── print per-upload stats if enabled ───────────────────────────────────
+	if s.statsEnabled {
+		saved := 0
+		if existed {
+			saved = len(d)
+		}
+		total := len(d) + len(sBlob)
+		pct := float64(saved) / float64(total) * 100
+		fmt.Printf(
+			"→ dedupe stats for file %s: reused %d bytes; saved %.1f%% of this upload’s payload\n",
+			fileID, saved, pct,
+		)
+	}
+
 	return
 }
 

@@ -1,16 +1,16 @@
-// cmd/server/main.go
 package main
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/joho/godotenv"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -20,7 +20,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsConfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/kms"
-
 	"go.uber.org/zap"
 
 	"github.com/Anish-Chanda/double-layer-dedup/internal/config"
@@ -31,59 +30,58 @@ import (
 	"github.com/Anish-Chanda/double-layer-dedup/internal/storage"
 )
 
-func loadAWSConfig(region string) (aws.Config, error) {
-	opts := []func(*awsConfig.LoadOptions) error{
-		awsConfig.WithRegion(region),
-	}
+func loadAWSConfig(region string) (cfg aws.Config, err error) {
+	opts := []func(*awsConfig.LoadOptions) error{awsConfig.WithRegion(region)}
 	if ep := os.Getenv("AWS_ENDPOINT_URL"); ep != "" {
-		resolver := aws.EndpointResolverFunc(
+		res := aws.EndpointResolverFunc(
 			func(service, region string) (aws.Endpoint, error) {
 				return aws.Endpoint{URL: ep, SigningRegion: region}, nil
-			},
-		)
-		opts = append(opts, awsConfig.WithEndpointResolver(resolver))
+			})
+		opts = append(opts, awsConfig.WithEndpointResolver(res))
 	}
 	return awsConfig.LoadDefaultConfig(context.Background(), opts...)
 }
 
-func main() {
-	// 1) env
-	_ = godotenv.Load()
+type zapLoggerAdapter struct {
+	logger *zap.Logger
+}
 
-	// 2) config
+func (l *zapLoggerAdapter) Print(v ...interface{}) {
+	l.logger.Sugar().Info(v...)
+}
+
+func main() {
+	// parse our --stats flag
+	stats := flag.Bool("stats", false, "print per-upload dedupe statistics")
+	flag.Parse()
+
+	_ = godotenv.Load()
 	cfg, err := config.Load()
 	if err != nil {
 		panic(fmt.Errorf("config load: %w", err))
 	}
 
-	// 3) migrations
+	// apply migrations
 	m, err := migrate.New(
 		"file://"+os.Getenv("PWD")+"/migrations",
 		cfg.PostgresDSN,
 	)
 	if err != nil {
-		panic(fmt.Errorf("migrate init: %w", err))
+		panic(err)
 	}
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		panic(fmt.Errorf("migrate up: %w", err))
-	}
+	_ = m.Up() // ignore ErrNoChange
 
-	// 4) logger
+	// console-friendly logger
 	log := logger.New(cfg.LogLevel)
 	defer log.Sync()
-	// make zap.L() available globally
 	zap.ReplaceGlobals(log)
 
-	// 5) AWS config
+	// aws + infra clients
 	awsCfg, err := loadAWSConfig(cfg.AWSRegion)
 	if err != nil {
 		zap.L().Fatal("AWS config", zap.Error(err))
 	}
-
-	// 6) AWS clients
 	kmsClient := kms.NewFromConfig(awsCfg)
-
-	// 7) infra clients
 	storeClient, err := storage.NewWithClient(cfg.S3Bucket, awsCfg)
 	if err != nil {
 		zap.L().Fatal("S3 init", zap.Error(err))
@@ -93,14 +91,19 @@ func main() {
 		zap.L().Fatal("DB init", zap.Error(err))
 	}
 
-	// 8) DSDE service
+	// our DSDE service
 	fg := split.NewFG([]uint64{1, 3, 5}, []uint64{0, 0, 0})
-	svc := dsde.NewService(fg, 3, kmsClient, cfg.KMSKeyID, dbClient, storeClient)
+	svc := dsde.NewService(fg, 3, kmsClient, cfg.KMSKeyID, dbClient, storeClient, *stats)
 
-	// 9) HTTP router
+	// router w/ pretty request logs
 	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+
+	zapAdapter := &zapLoggerAdapter{logger: zap.L()}
+	r.Use(middleware.RequestLogger(&middleware.DefaultLogFormatter{Logger: zapAdapter, NoColor: false}))
+	r.Use(middleware.Recoverer)
+
 	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 
@@ -118,9 +121,9 @@ func main() {
 		}
 		resp := map[string]string{
 			"fileID":    fileID,
-			"feaHash":   hex.EncodeToString(feaHash),
-			"dekShared": hex.EncodeToString(dekShared),
-			"dekUser":   hex.EncodeToString(dekUser),
+			"feaHash":   fmt.Sprintf("%x", feaHash),
+			"dekShared": fmt.Sprintf("%x", dekShared),
+			"dekUser":   fmt.Sprintf("%x", dekUser),
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
@@ -128,12 +131,11 @@ func main() {
 
 	r.Get("/files/{fileID}", func(w http.ResponseWriter, r *http.Request) {
 		owner := r.Header.Get("X-Owner-ID")
-		fileID := chi.URLParam(r, "fileID")
 		if owner == "" {
 			http.Error(w, "missing owner header", http.StatusBadRequest)
 			return
 		}
-		rc, err := svc.Download(r.Context(), owner, fileID)
+		rc, err := svc.Download(r.Context(), owner, chi.URLParam(r, "fileID"))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -149,13 +151,9 @@ func main() {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(keys)
 	})
 
-	// 10) start
 	zap.L().Info("starting server", zap.String("addr", cfg.ServerAddr))
-	if err := http.ListenAndServe(cfg.ServerAddr, r); err != nil {
-		zap.L().Fatal("server failed", zap.Error(err))
-	}
+	http.ListenAndServe(cfg.ServerAddr, r)
 }
